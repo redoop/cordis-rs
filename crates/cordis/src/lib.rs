@@ -1,4 +1,4 @@
-//! # cordis-rs
+//! # cordis-rust
 //!
 //! A Rust port of the cordis plugin kernel — the same kernel DSH uses to
 //! compose its entire desktop harness out of ~200 small packages. The design

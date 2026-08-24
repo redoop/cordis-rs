@@ -1,4 +1,4 @@
-//! Timer service plugin for cordis-rs — the analogue of `@deepseek-ai/cordis-plugin-timer`.
+//! Timer service plugin for cordis-rust — the analogue of `@deepseek-ai/cordis-plugin-timer`.
 //!
 //! Provides the `timer` service: timeout and interval primitives whose
 //! underlying tasks are fiber effects, so every pending timer is cancelled
