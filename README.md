@@ -3,6 +3,8 @@
 [![crates.io](https://img.shields.io/crates/v/cordis-rust)](https://crates.io/crates/cordis-rust)
 [![docs.rs](https://img.shields.io/docsrs/cordis-rust)](https://docs.rs/cordis-rust)
 
+> [**中文版 README**](README.zh-CN.md) · [English](README.md)
+
 A Rust port of the cordis kernel that powers the DSH plugin system. Same
 mental model, same lifecycle grammar, adapted to ownership: the runtime is
 tokio, plugins are Send futures, and services live in a two-level store
