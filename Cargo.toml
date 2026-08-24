@@ -12,7 +12,7 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "ti
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-cordis = { path = "crates/cordis" }
+cordis = { package = "cordis-rust", path = "crates/cordis" }
 
 [profile.dev]
 opt-level = 0
