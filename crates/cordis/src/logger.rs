@@ -38,6 +38,20 @@ impl fmt::Display for LogLevel {
 /// The logger service contract.
 pub trait Logger: Send + Sync + 'static {
     fn log(&self, level: LogLevel, message: String);
+
+    /// Structured write: attaches an originating event name and an optional
+    /// stable machine-readable error code. The default implementation keeps a
+    /// single-format sink by folding both into the message text
+    /// (`[event=… code=…] …`); richer backends override this to serialize
+    /// fields separately. Concrete `String` parameters keep the trait
+    /// object-safe (no generic methods on `dyn Logger`).
+    fn log_event(&self, level: LogLevel, event: String, code: Option<String>, message: String) {
+        let prefix = match code {
+            Some(code) => format!("[event={event} code={code}]"),
+            None => format!("[event={event}]"),
+        };
+        self.log(level, format!("{prefix} {message}"));
+    }
 }
 
 /// Minimum level filter shared by default loggers.
@@ -89,3 +103,49 @@ impl Logger for DefaultLogger {
 /// Trait objects cannot implement `Any` directly, so the store wraps them in
 /// this newtype; `Context::logger()` downcasts to recover the trait object.
 pub struct LoggerHandle(pub Arc<dyn Logger>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records raw `log` calls so the default `log_event` folding is observable.
+    struct RecordingLogger {
+        lines: Mutex<Vec<(LogLevel, String)>>,
+    }
+    impl Logger for RecordingLogger {
+        fn log(&self, level: LogLevel, message: String) {
+            self.lines.lock().unwrap().push((level, message));
+        }
+    }
+
+    #[test]
+    fn log_event_default_folds_event_and_code() {
+        let logger = RecordingLogger { lines: Mutex::new(Vec::new()) };
+        logger.log_event(
+            LogLevel::Warn,
+            "ping".to_string(),
+            Some("timeout".to_string()),
+            "listener failed: boom".to_string(),
+        );
+        assert_eq!(
+            logger.lines.lock().unwrap().as_slice(),
+            [(LogLevel::Warn, "[event=ping code=timeout] listener failed: boom".to_string())]
+        );
+    }
+
+    #[test]
+    fn log_event_omits_code_when_absent() {
+        let logger = RecordingLogger { lines: Mutex::new(Vec::new()) };
+        logger.log_event(
+            LogLevel::Error,
+            "fiber".to_string(),
+            None,
+            "startup failed".to_string(),
+        );
+        assert_eq!(
+            logger.lines.lock().unwrap().as_slice(),
+            [(LogLevel::Error, "[event=fiber] startup failed".to_string())]
+        );
+    }
+}

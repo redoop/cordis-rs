@@ -275,9 +275,11 @@ impl EventsService {
                 if let Err(err) = (callback)(hook_ctx, payload, next).await {
                     logger_ctx
                         .logger()
-                        .log(
+                        .log_event(
                             crate::logger::LogLevel::Warn,
-                            format!("[{label}] listener failed: {err}"),
+                            label.clone(),
+                            err.code().map(str::to_string),
+                            format!("listener failed: {err}"),
                         );
                 }
             });
@@ -308,9 +310,11 @@ impl EventsService {
                     if let Err(err) = (callback)(hook_ctx, payload, next).await {
                         logger_ctx
                             .logger()
-                            .log(
+                            .log_event(
                                 crate::logger::LogLevel::Warn,
-                                format!("[{label}] listener failed: {err}"),
+                                label.clone(),
+                                err.code().map(str::to_string),
+                                format!("listener failed: {err}"),
                             );
                     }
                 });
@@ -340,9 +344,11 @@ impl EventsService {
                 if let Err(err) = (callback)(hook_ctx, payload, next).await {
                     logger_ctx
                         .logger()
-                        .log(
+                        .log_event(
                             crate::logger::LogLevel::Warn,
-                            format!("[{label}] listener failed: {err}"),
+                            label.clone(),
+                            err.code().map(str::to_string),
+                            format!("listener failed: {err}"),
                         );
                 }
             });

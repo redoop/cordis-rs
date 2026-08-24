@@ -139,6 +139,18 @@ impl Error {
     pub fn aggregate(errors: Vec<Error>) -> Self {
         Error::Aggregate(errors)
     }
+
+    /// A stable, machine-readable classifier for structured logs: the coded
+    /// lifecycle error's `CordisCode`, `"validation"`, `"aggregate"`, or
+    /// `None` for free-form errors.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Error::Coded(coded) => Some(coded.code.as_str()),
+            Error::Validation(_) => Some("validation"),
+            Error::Aggregate(_) => Some("aggregate"),
+            Error::Other(_) => None,
+        }
+    }
 }
 
 struct StringError(String);
@@ -176,5 +188,19 @@ impl From<String> for Error {
 impl From<&str> for Error {
     fn from(value: &str) -> Self {
         Error::msg(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_classifies_stable_kinds() {
+        assert_eq!(Error::msg("free").code(), None);
+        assert_eq!(Error::Validation(ValidationError(vec![])).code(), Some("validation"));
+        assert_eq!(Error::aggregate(vec![Error::msg("x")]).code(), Some("aggregate"));
+        let coded: Error = CordisError::new(CordisCode::Timeout).into();
+        assert_eq!(coded.code(), Some("operation timed out"));
     }
 }

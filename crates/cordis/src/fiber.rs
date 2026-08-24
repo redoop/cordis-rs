@@ -320,8 +320,13 @@ impl Fiber {
     }
 
     async fn log_error(self: &Arc<Self>, err: Error) {
-        let message = format!("[{}] error: {err}", self.name());
-        self.ctx().logger().log(crate::logger::LogLevel::Error, message);
+        let name = self.name();
+        self.ctx().logger().log_event(
+            crate::logger::LogLevel::Error,
+            "fiber".to_string(),
+            err.code().map(str::to_string),
+            format!("{name}: {err}"),
+        );
     }
 
     /// Drain every live effect LIFO, sequentially. Entries are taken out of
