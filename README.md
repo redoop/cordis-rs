@@ -66,10 +66,15 @@ traits on Context (see TimerContextExt), which is static, typed, and zero-cost.
     tests/events.rs               dispatch-mode semantics
     tests/isolate.rs              isolation + intercept layering
 
+    crates/plugin-contract/       zero-dep C-ABI surface for dynamic plugins
+    crates/greeter-plugin/        cdylib plugin loaded at RUNTIME by dynhost
+    crates/dynhost/               dlopen host: adapts exports to trait Plugin
+
 ## Try it
 
     cargo run -p cordis --example mini_dsh   # compose -> converge -> hot-update -> stop
-    cargo test --workspace                   # 23 tests, all green
+    cargo test --workspace                   # 27 tests, all green
+    cargo run -p dynhost                     # dlopen a .dylib/.so plugin at runtime
 
 The example registers an API server *before* its database exists, watches
 the graph fill in, hot-swaps settings, then shuts down LIFO - no manual

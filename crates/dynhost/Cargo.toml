@@ -1,0 +1,11 @@
+[package]
+name = "dynhost"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cordis.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+libloading = "0.8"
+plugin-contract = { path = "../plugin-contract" }

@@ -1,0 +1,10 @@
+[package]
+name = "greeter-plugin"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+plugin-contract = { path = "../plugin-contract" }
