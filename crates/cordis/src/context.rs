@@ -9,6 +9,15 @@
 //! One documented deviation from JS cordis: lifecycle mutations (`provide`,
 //! `on`) are `async` because effects run on the async runtime; reads stay
 //! synchronous like the proxy path.
+//!
+//! ## Lock ordering
+//!
+//! Global acquisition order — never hold an earlier lock while taking a later
+//! one: `root.reflect` < `root.registry` < `root.fibers` < fiber-internal
+//! locks. `get`/`require` read `reflect` (fast path) then may consult
+//! `root.fibers` via `fiber_is_active`; the fiber's own `state()` is a
+//! lock-free atomic read (see `fiber.rs`), so typed reads never enter the
+//! fiber-internal lock set.
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};

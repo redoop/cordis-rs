@@ -9,9 +9,21 @@
 //! States mirror cordis exactly:
 //! PENDING -> LOADING -> ACTIVE -> UNLOADING -> (PENDING|LOADING|DISPOSED),
 //! with FAILED retained when startup errored while inactive.
+//!
+//! ## Lock ordering
+//!
+//! Global order (never acquire a later lock while holding an earlier one):
+//! `root.reflect` < `root.registry` < `root.fibers` < fiber-internal locks
+//! (`uid`, `error`, `loaded`, `driver`, `disposables`, `store`).
+//! In particular: `state()` NEVER touches the mutexes — it reads the atomic
+//! [`Fiber::state_cache`] mirror, which transition points republish via
+//! [`Fiber::cache_state`] (which itself takes the mutexes; call it only when
+//! no fiber-internal lock is held). Notifications run in two phases (snapshot
+//! under one lock, re-check + refresh outside it) because `std::sync::Mutex`
+//! is not re-entrant.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
@@ -29,20 +41,26 @@ pub type Disposer = Box<dyn FnOnce() -> BoxFuture<()> + Send>;
 pub const EPOCH_INACTIVE: &str = "";
 
 /// Lifecycle state of a fiber.
+///
+/// Kept as one `repr(u8)` because the converged state is mirrored into an
+/// atomic cache ([`Fiber::state_cache`]): the hot path (`fiber_is_active`
+/// during every typed service read) must observe it WITHOUT taking the
+/// lifecycle mutexes, while each transition point re-derives and republishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum FiberState {
     /// Registered but waiting for required services.
-    Pending,
+    Pending = 0,
     /// Running the plugin body right now.
-    Loading,
+    Loading = 1,
     /// The plugin body completed and all effects are live.
-    Active,
+    Active = 2,
     /// Startup failed; the fiber waits for dependency changes to retry.
-    Failed,
+    Failed = 3,
     /// Draining effects (LIFO) after deactivation.
-    Unloading,
+    Unloading = 4,
     /// Fully disposed; uid cleared.
-    Disposed,
+    Disposed = 5,
 }
 
 impl FiberState {
@@ -55,6 +73,20 @@ impl FiberState {
             FiberState::Unloading => "unloading",
             FiberState::Disposed => "disposed",
         }
+    }
+
+    /// Decode the atomic cache value. Unknown bytes are treated as
+    /// [`FiberState::Pending`] by the caller.
+    pub(crate) fn from_repr(value: u8) -> Option<FiberState> {
+        Some(match value {
+            0 => FiberState::Pending,
+            1 => FiberState::Loading,
+            2 => FiberState::Active,
+            3 => FiberState::Failed,
+            4 => FiberState::Unloading,
+            5 => FiberState::Disposed,
+            _ => return None,
+        })
     }
 }
 
@@ -97,6 +129,10 @@ pub struct Fiber {
     next_effect_id: AtomicU64,
     driver: Mutex<DriveState>,
     settle: (tokio::sync::watch::Sender<u64>, tokio::sync::watch::Receiver<u64>),
+    /// Atomic mirror of the derived [`FiberState`]: lock-free reads on the hot
+    /// path ([`Fiber::state`]); republished at every transition point via
+    /// [`Fiber::cache_state`].
+    state_cache: AtomicU8,
 }
 
 impl Fiber {
@@ -142,6 +178,7 @@ impl Fiber {
                 task: None,
             }),
             settle: (settle_tx, settle_rx),
+            state_cache: AtomicU8::new(FiberState::Pending as u8),
         }
     }
 
@@ -164,8 +201,20 @@ impl Fiber {
         tx.send_modify(|v| *v += 1);
     }
 
-    /// Current lifecycle state (derived, mirroring cordis `_getState`).
+    /// Current lifecycle state: a lock-free read of the atomic mirror.
+    ///
+    /// The mirror is republished at every transition point ([`Fiber::cache_state`]),
+    /// so the hot path never takes the lifecycle mutexes (which themselves
+    /// would deadlock when called from within a locked driver loop elsewhere).
     pub fn state(&self) -> FiberState {
+        FiberState::from_repr(self.state_cache.load(Ordering::Acquire))
+            .unwrap_or(FiberState::Pending)
+    }
+
+    /// Derive the converged lifecycle state from the live flags (mirroring
+    /// cordis `_getState`). Reads the lifecycle mutexes; only transition
+    /// points and tests call this.
+    fn compute_state(&self) -> FiberState {
         if self.uid.lock().unwrap().is_none() {
             return FiberState::Disposed;
         }
@@ -187,6 +236,15 @@ impl Fiber {
             return FiberState::Active;
         }
         FiberState::Pending
+    }
+
+    /// Republish the derived state into the atomic mirror. Called at every
+    /// transition point (request/load/unload/fail/dispose) BEFORE any
+    /// observability event, so `state()` and `internal/status` agree.
+    fn cache_state(&self) -> FiberState {
+        let state = self.compute_state();
+        self.state_cache.store(state as u8, Ordering::Release);
+        state
     }
 
     /// Emit internal/status for observability plugins (inventory/HMR style).
@@ -345,6 +403,8 @@ impl Fiber {
                 driver.task = Some(tokio::spawn(Self::drive_loop(self.clone())));
             }
         }
+        
+        self.cache_state();
         self.bump_settle();
         self.publish_state();
     }
@@ -363,6 +423,7 @@ impl Fiber {
 
                     driver.task = None;
                     drop(driver);
+                    self.cache_state();
                     self.bump_settle();
                     self.publish_state();
                     return;
@@ -384,6 +445,8 @@ impl Fiber {
                 // Nothing to load; converge as Pending.
                 let mut driver = self.driver.lock().unwrap();
                 driver.force = false;
+                drop(driver);
+                self.cache_state();
                 continue;
             }
             self.load_once(target).await;
@@ -395,6 +458,8 @@ impl Fiber {
         self.unload_effects().await;
         self.store.lock().unwrap().clear();
         *self.loaded.lock().unwrap() = EPOCH_INACTIVE.to_string();
+        
+        self.cache_state();
         self.bump_settle();
         self.publish_state();
     }
@@ -433,6 +498,12 @@ impl Fiber {
             Ok(()) => {
                 self.error.lock().unwrap().take();
                 *self.loaded.lock().unwrap() = target;
+                // Republish the state BEFORE notifying dependents: their
+                // `resolve_impl`/`check_impl` consult `fiber_is_active`, and
+                // that reads the atomic state mirror. With an eager derived
+                // state this was implicit; with the cache it must be explicit
+                // here or dependents never see this fiber as Active.
+                self.cache_state();
                 // Re-broadcast this fiber's provided services now that it is
                 // ACTIVE: dependents whose first notification arrived while we
                 // were still LOADING re-check here (cordis does the same on
@@ -440,7 +511,6 @@ impl Fiber {
                 crate::service::notify(self.ctx(), &self.provided_names());
 
                 self.bump_settle();
-
                 self.publish_state();
 
             }
@@ -462,6 +532,8 @@ impl Fiber {
         let mut driver = self.driver.lock().unwrap();
         driver.desired = EPOCH_INACTIVE.to_string();
         drop(driver);
+        
+        self.cache_state();
         self.bump_settle();
         self.publish_state();
     }
@@ -489,6 +561,40 @@ impl Fiber {
             let _ = rx.borrow_and_update().clone();
             if rx.changed().await.is_err() {
                 break;
+            }
+        }
+        match self.error.lock().unwrap().as_ref() {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Like [`Fiber::join`], but gives up after `timeout` and returns a
+    /// timeout error while the driver keeps converging in the background.
+    ///
+    /// A plugin whose `apply` never completes used to wedge `join` (and with
+    /// it `FiberHandle::dispose`) forever; this bounds the wait so callers can
+    /// decide whether to keep waiting, restart, or dispose.
+    pub async fn join_with_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        let mut rx = self.settle.1.clone();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let busy = {
+                let driver = self.driver.lock().unwrap();
+                driver.dirty
+                    || driver.task.as_ref().map_or(false, |t| !t.is_finished())
+                    || *self.loaded.lock().unwrap() != driver.desired
+            };
+            if !busy {
+                break;
+            }
+            let _ = rx.borrow_and_update().clone();
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::msg(format!("join(\"{}\") timed out", self.name())));
+            }
+            if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
+                return Err(Error::msg(format!("join(\"{}\") timed out", self.name())));
             }
         }
         match self.error.lock().unwrap().as_ref() {
@@ -546,6 +652,7 @@ impl Fiber {
             return;
         }
         *self.uid.lock().unwrap() = None;
+        self.cache_state();
         if old_uid != Some(0) {
             RegistryService::remove_fiber(&self.ctx().root, self);
             self.ctx().root.unregister_fiber(old_uid.unwrap());
@@ -631,6 +738,11 @@ impl FiberHandle {
     pub async fn join(&self) -> Result<()> {
 
         self.0.join().await
+    }
+
+    /// Like [`FiberHandle::join`], bounded by `timeout` (see [`Fiber::join_with_timeout`]).
+    pub async fn join_with_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        self.0.join_with_timeout(timeout).await
     }
 
     /// Dispose and reload with the current config.

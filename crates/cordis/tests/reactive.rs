@@ -249,3 +249,65 @@ async fn internal_status_events_track_transitions() {
 
     ctx.stop().await;
 }
+
+#[tokio::test]
+async fn state_cache_tracks_loading_then_active_then_disposed() {
+    // The atomic state mirror must be observable lock-free and consistent with
+    // every transition point (P1: state() used to chain four mutexes).
+    let gate = Arc::new(tokio::sync::Notify::new());
+
+    let g1 = gate.clone();
+    let gated = plugin("gated", move |_ctx: Context, _c: ()| {
+        let g = g1.clone();
+        async move {
+            g.notified().await;
+            Ok(())
+        }
+    });
+
+    let ctx = Context::new();
+    let fiber = ctx.plugin(gated, None);
+
+    // The driver is parked inside apply() → converged state is Loading.
+    assert_eq!(fiber.state(), FiberState::Loading);
+
+    gate.notify_one();
+    fiber.join().await.expect("converges after release");
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    ctx.stop().await;
+    assert_eq!(fiber.state(), FiberState::Disposed);
+}
+
+#[tokio::test]
+async fn join_with_timeout_bounds_a_never_finishing_apply() {
+    // A plugin whose apply() never completes used to wedge join() forever;
+    // the bounded join returns a timeout error while the driver keeps running.
+    let gate = Arc::new(tokio::sync::Notify::new());
+
+    let g1 = gate.clone();
+    let stuck = plugin("stuck", move |_ctx: Context, _c: ()| {
+        let g = g1.clone();
+        async move {
+            g.notified().await;
+            Ok(())
+        }
+    });
+
+    let ctx = Context::new();
+    let fiber = ctx.plugin(stuck, None);
+    assert_eq!(fiber.state(), FiberState::Loading);
+
+    let err = fiber
+        .join_with_timeout(Duration::from_millis(100))
+        .await
+        .expect_err("join must time out while apply is parked");
+    assert!(err.to_string().contains("timed out"), "got: {err}");
+
+    // The fiber is still healthy: releasing the gate lets it converge, and a
+    // later unbounded join succeeds.
+    gate.notify_one();
+    fiber.join().await.expect("converges after release");
+    assert_eq!(fiber.state(), FiberState::Active);
+    ctx.stop().await;
+}

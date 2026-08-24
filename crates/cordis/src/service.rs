@@ -5,6 +5,15 @@
 //! chain; `isolate()` rewrites exactly one name to a fresh (or joined) label,
 //! so different subtrees can host independent implementations of the same
 //! service — without touching their parent scopes.
+//!
+//! ## Lock ordering
+//!
+//! This layer owns the innermost lock (`root.reflect`). Callers must never
+//! hold it while acquiring `root.registry` / `root.fibers` or any fiber
+//! lock. `notify` therefore runs in two phases: snapshot interested fibers
+//! under `reflect`/`fibers`, then re-check and refresh with no locks held
+//! (`std::sync::Mutex` is not re-entrant). Availability predicates run with
+//! `reflect` released for the same reason.
 
 use std::collections::HashMap;
 use std::sync::Arc;
