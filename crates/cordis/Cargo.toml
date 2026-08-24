@@ -4,14 +4,15 @@ description = "A Rust port of the cordis plugin kernel: context/fiber/registry/s
 # crates.io already has `cordis` (placeholder) and `cordis-rs`, so the project
 # is named cordis-rust; the library target keeps the name `cordis` so
 # consumers keep writing `use cordis::...` unchanged.
-[lib]
-name = "cordis"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository = "https://github.com/redoop/cordis-rs"
 keywords = ["plugin", "kernel", "dependency-injection", "event-bus", "framework"]
 categories = ["development-tools", "asynchronous"]
+
+[lib]
+name = "cordis"
 
 [dependencies]
 tokio = { workspace = true }
