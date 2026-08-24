@@ -124,3 +124,23 @@ async fn scope_identity_and_effect_introspection() {
 
     ctx.stop().await;
 }
+
+#[tokio::test]
+async fn accessor_reads_are_stable_under_high_frequency() {
+    // The hot path for accessor reads must stay lock-light and exact: every
+    // read recomputes, and repeated reads observe a stable value.
+    let ctx = Context::new();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let db = ctx.plugin(database_plugin(), None);
+    let summary = ctx.plugin(summary_plugin(reads.clone()), None);
+    db.join().await.unwrap();
+    summary.join().await.unwrap();
+
+    for i in 0..1000usize {
+        let value = ctx.get::<Database>("summary").expect("accessor live");
+        assert_eq!(value.url, "PROVIDED");
+        let _ = i;
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1000, "every read recomputes");
+    ctx.stop().await;
+}

@@ -64,6 +64,12 @@ pub struct RootState {
     pub(crate) root_fiber: std::sync::OnceLock<Arc<Fiber>>,
     pub(crate) counter: AtomicU64,
     label_seed: AtomicU64,
+    /// Lock-free mirror of which fiber uids are ACTIVE (bit `uid` set).
+    /// Maintained by [`Fiber::cache_state`] at every transition point, so it
+    /// agrees with the atomic state mirror; lets `fiber_is_active` answer the
+    /// hot-path "is this provider live?" question without touching
+    /// `root.fibers`. uids >= 64 fall back to the locked path.
+    pub(crate) active_fibers: AtomicU64,
 }
 
 impl RootState {
@@ -76,9 +82,21 @@ impl RootState {
     }
 
     /// The root fiber (uid 0) is always considered active; it owns built-ins.
+    ///
+    /// Lock-free fast path: the `active_fibers` bitmask mirrors the atomic
+    /// state cache (maintained by `Fiber::cache_state`), so every ACTIVE
+    /// provider answers without touching `root.fibers`. uids >= 64 (or
+    /// non-active uids, whose bit is never set) fall back to the locked
+    /// look-up, which is the cold path.
     pub(crate) fn fiber_is_active(&self, uid: u64) -> bool {
         if uid == 0 {
             return true;
+        }
+        if uid < 64 {
+            let bit = 1u64 << (uid as u32);
+            if self.active_fibers.load(Ordering::Acquire) & bit != 0 {
+                return true;
+            }
         }
         self.fibers
             .lock()
@@ -131,6 +149,7 @@ impl Context {
             root_fiber: std::sync::OnceLock::new(),
             counter: AtomicU64::new(0),
             label_seed: AtomicU64::new(1),
+            active_fibers: AtomicU64::new(0),
         });
         let ctx = Context { root: root.clone(), scope: ScopeNode::root(), fiber: Weak::new() };
 

@@ -244,6 +244,20 @@ impl Fiber {
     fn cache_state(&self) -> FiberState {
         let state = self.compute_state();
         self.state_cache.store(state as u8, Ordering::Release);
+        // Maintain the root's lock-free ACTIVE bitmask (bit `uid` set exactly
+        // while ACTIVE) — the fast path of `RootState::fiber_is_active`.
+        let uid = *self.uid.lock().unwrap();
+        if let Some(uid) = uid {
+            if uid < 64 {
+                let root = &self.ctx().root;
+                let bit = 1u64 << (uid as u32);
+                if state == FiberState::Active {
+                    root.active_fibers.fetch_or(bit, Ordering::SeqCst);
+                } else {
+                    root.active_fibers.fetch_and(!bit, Ordering::SeqCst);
+                }
+            }
+        }
         state
     }
 
@@ -656,6 +670,17 @@ impl Fiber {
         if old_uid.is_none() {
             return;
         }
+        // Clear the ACTIVE bit before wiping the uid: cache_state can no
+        // longer identify this fiber afterwards, so a stale bit would make
+        // fiber_is_active answer "active" for a disposed provider.
+        if let Some(uid) = old_uid {
+            if uid != 0 && uid < 64 {
+                self.ctx()
+                    .root
+                    .active_fibers
+                    .fetch_and(!(1u64 << (uid as u32)), Ordering::SeqCst);
+            }
+        }
         *self.uid.lock().unwrap() = None;
         self.cache_state();
         if old_uid != Some(0) {
@@ -792,5 +817,45 @@ impl EffectGuard {
                 .iter()
                 .any(|slot| matches!(slot, Some((id, _, _)) if *id == self.id))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::plugin;
+    use crate::Plugin;
+
+    #[tokio::test]
+    async fn active_bitmask_tracks_lifecycle_locklessly() {
+        let ctx = Context::new();
+        // An immediately-completing plugin: uid is allocated sequentially (>=1).
+        let ready = plugin("ready", |_ctx: Context, _c: serde_json::Value| async move { Ok(()) });
+        let fiber = ctx.plugin(ready as Arc<dyn Plugin>, None);
+        let uid = fiber.uid().expect("allocated");
+
+        // Not yet converged: bit clear, locked path reports pending.
+        assert_eq!(
+            ctx.root.active_fibers.load(Ordering::SeqCst) & (1u64 << (uid as u32)),
+            0,
+            "bit must be clear while loading"
+        );
+
+        fiber.join().await.unwrap();
+        assert_ne!(
+            ctx.root.active_fibers.load(Ordering::SeqCst) & (1u64 << (uid as u32)),
+            0,
+            "bit must be set while Active"
+        );
+        // The lock-free fast path agrees with the locked look-up.
+        assert!(ctx.root.fiber_is_active(uid));
+
+        fiber.dispose().await;
+        assert_eq!(
+            ctx.root.active_fibers.load(Ordering::SeqCst) & (1u64 << (uid as u32)),
+            0,
+            "bit must be cleared after dispose (no stale provider liveness)"
+        );
+        assert!(!ctx.root.fiber_is_active(uid));
     }
 }
