@@ -1,0 +1,11 @@
+[package]
+name = "cordis-plugin-timer"
+description = "Timer service plugin for cordis-rs: fiber-owned timeout/interval effects."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cordis = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
