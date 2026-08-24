@@ -409,6 +409,21 @@ impl Context {
         EventsService::on(self, name, Arc::new(listener), false, false).await
     }
 
+    /// Register a listener into the **sync slot**: [`Context::emit_sync`]
+    /// awaits it inline on the dispatching task (zero task spawns), the
+    /// low-overhead hot path for high-frequency events such as per-token
+    /// stream deltas. Fire-and-forget [`Context::emit`] still spawns it like
+    /// any other listener.
+    pub async fn on_sync<L>(&self, name: &str, listener: L) -> Result<EffectGuard>
+    where
+        L: Fn(Context, Value, crate::events::Next) -> BoxFuture<Result<Value>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        EventsService::on_sync(self, name, Arc::new(listener), false, false).await
+    }
+
     /// Register a global prepend listener (ignores scope filters).
     pub async fn on_global<L>(&self, name: &str, listener: L) -> Result<EffectGuard>
     where
@@ -446,9 +461,28 @@ impl Context {
         EventsService::parallel(self, name, payload).await
     }
 
+    /// Concurrent dispatch bounded by `timeout`; unfinished listeners are
+    /// abandoned and a `CordisCode::Timeout` error is returned.
+    pub async fn parallel_timeout(
+        &self,
+        name: &str,
+        payload: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        EventsService::parallel_timeout(self, name, payload, timeout).await
+    }
+
     /// Fire-and-forget dispatch; failures are logged.
     pub fn emit(&self, name: &str, payload: Value) {
         EventsService::emit(self, name, payload);
+    }
+
+    /// Dispatch the **sync slot** inline (zero spawns) while ordinary
+    /// listeners still run detached: sync-listener failures are aggregated
+    /// and reported instead of swallowed. Prefer this on hot paths that
+    /// already sit in an async context (stream deltas, per-token events).
+    pub async fn emit_sync(&self, name: &str, payload: Value) -> Result<()> {
+        EventsService::emit_sync(self, name, payload).await
     }
 
     /// Sequential dispatch until the first bail value.

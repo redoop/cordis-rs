@@ -16,6 +16,8 @@ pub enum CordisCode {
     ForeignService,
     /// A required service was read while its providing fiber is inactive.
     ServiceUnavailable,
+    /// A bounded wait (join, parallel) exceeded its deadline.
+    Timeout,
 }
 
 impl CordisCode {
@@ -26,6 +28,7 @@ impl CordisCode {
             CordisCode::DuplicateService => "service has already been registered",
             CordisCode::ForeignService => "cannot set service provided by another fiber",
             CordisCode::ServiceUnavailable => "cannot get required service in inactive context",
+            CordisCode::Timeout => "operation timed out",
         }
     }
 }

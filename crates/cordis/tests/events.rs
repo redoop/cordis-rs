@@ -201,3 +201,151 @@ async fn once_fires_exactly_once() {
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn emit_sync_runs_sync_listeners_inline_before_returning() {
+    // Inline execution is observable as STRICT ORDERING: a sync-slot listener
+    // that awaits a yield still completes before emit_sync returns, so the
+    // recorded sequence is ["hear", "after"]. A spawned listener could be
+    // reordered (["after", "hear"]), which is exactly the overhead/coupling
+    // the sync slot removes.
+    let ctx = Context::new();
+    let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+    ctx.on_sync("ordered", {
+        let order = order.clone();
+        move |_ctx, _p, _n| {
+            let order = order.clone();
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                order.lock().unwrap().push("hear");
+                Ok(Value::Null)
+            })
+        }
+    })
+    .await
+    .unwrap();
+
+    ctx.emit_sync("ordered", json!(null)).await.expect("sync dispatch succeeds");
+    order.lock().unwrap().push("after");
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        ["hear", "after"],
+        "sync listener must complete inline before emit_sync returns"
+    );
+
+    // Fire-and-forget emit STILL spawns sync-slot listeners: the same
+    // listener may observe "after" first (no ordering guarantee).
+    let order2 = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let order2_for_listener = order2.clone();
+    ctx.on_sync("unordered", move |_ctx, _p, _n| {
+        let order = order2_for_listener.clone();
+        Box::pin(async move {
+            order.lock().unwrap().push("hear");
+            Ok(Value::Null)
+        })
+    })
+    .await
+    .unwrap();
+    ctx.emit("unordered", json!(null));
+    order2.lock().unwrap().push("after");
+    // Give the detached listener a beat so "hear" is usually recorded too.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let recorded = order2.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2, "spawned listener must still fire, got {recorded:?}");
+    ctx.stop().await;
+}
+
+#[tokio::test]
+async fn emit_sync_aggregates_sync_failures_while_ordinary_listeners_run() {
+    let ctx = Context::new();
+    let hits = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+    ctx.on_sync("mixed", {
+        let hits = hits.clone();
+        move |_ctx, _p, _n| {
+            let hits = hits.clone();
+            Box::pin(async move {
+                hits.lock().unwrap().push("sync-bad");
+                Err(cordis::Error::msg("sync boom"))
+            })
+        }
+    })
+    .await
+    .unwrap();
+    ctx.on("mixed", {
+        let hits = hits.clone();
+        move |_ctx, _p, _n| {
+            let hits = hits.clone();
+            Box::pin(async move {
+                hits.lock().unwrap().push("spawned-ok");
+                Ok(Value::Null)
+            })
+        }
+    })
+    .await
+    .unwrap();
+
+    // Sync-slot failure surfaces as an aggregate; the spawned listener still
+    // runs (its error/failure rule is unchanged: fire-and-forget).
+    let err = ctx.emit_sync("mixed", json!(null)).await.expect_err("aggregate");
+    assert!(matches!(err, cordis::Error::Aggregate(_)), "{err}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let recorded = hits.lock().unwrap().clone();
+    assert!(recorded.contains(&"sync-bad"));
+    assert!(recorded.contains(&"spawned-ok"));
+    ctx.stop().await;
+}
+
+#[tokio::test]
+async fn parallel_timeout_bounds_hung_listeners() {
+    let ctx = Context::new();
+    // A listener that never answers; parallel would wait forever.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctx.on("hung", {
+        let gate = gate.clone();
+        move |_ctx, _p, _n| {
+            let gate = gate.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                Ok(Value::Null)
+            })
+        }
+    })
+    .await
+    .unwrap();
+
+    let err = ctx
+        .parallel_timeout("hung", json!(null), std::time::Duration::from_millis(100))
+        .await
+        .expect_err("must time out");
+    assert!(
+        matches!(err, cordis::Error::Coded(ref coded) if coded.code == cordis::CordisCode::Timeout),
+        "expected coded Timeout, got: {err}"
+    );
+    gate.notify_one();
+    ctx.stop().await;
+}
+
+#[tokio::test]
+async fn parallel_without_timeout_still_waits_for_all() {
+    let ctx = Context::new();
+    let hits = Arc::new(std::sync::Mutex::new(0usize));
+    for _ in 0..3 {
+        let hits = hits.clone();
+        ctx.on("all", move |_ctx, _p, _n| {
+            let hits = hits.clone();
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                *hits.lock().unwrap() += 1;
+                Ok(Value::Null)
+            })
+        })
+        .await
+        .unwrap();
+    }
+    let out = ctx.parallel("all", json!(7)).await.unwrap();
+    assert_eq!(out, json!(7));
+    assert_eq!(*hits.lock().unwrap(), 3);
+    ctx.stop().await;
+}

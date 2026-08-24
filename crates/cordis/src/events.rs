@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::context::Context;
-use crate::error::{Error, Result};
+use crate::error::{CordisCode, CordisError, Error, Result};
 use crate::fiber::{Disposer, EffectGuard};
 use crate::plugin::BoxFuture;
 
@@ -28,6 +28,9 @@ pub(crate) struct Hook {
     pub prepend: bool,
     /// Global listeners ignore scope filters during dispatch.
     pub global: bool,
+    /// Sync listeners are awaited INLINE by `emit_sync` on the dispatching
+    /// task (zero spawns); fire-and-forget `emit` still spawns them.
+    pub sync: bool,
 }
 
 /// Continuation handle for waterfall composition.
@@ -90,14 +93,14 @@ impl EventStore {
         &self,
         name: &str,
         filter: Option<&(dyn Fn(&Context) -> bool + Send + Sync)>,
-    ) -> Vec<(Context, Listener)> {
+    ) -> Vec<(Context, Listener, bool)> {
         self.hooks
             .get(name)
             .map(|hooks| {
                 hooks
                     .iter()
                     .filter(|hook| hook.global || filter.map_or(true, |f| f(&hook.ctx)))
-                    .map(|hook| (hook.ctx.clone(), hook.callback.clone()))
+                    .map(|hook| (hook.ctx.clone(), hook.callback.clone(), hook.sync))
                     .collect()
             })
             .unwrap_or_default()
@@ -136,6 +139,30 @@ impl EventsService {
         prepend: bool,
         global: bool,
     ) -> Result<EffectGuard> {
+        Self::on_with(ctx, name, callback, prepend, global, false).await
+    }
+
+    /// Like [`EventsService::on`], but the listener joins the **sync slot**:
+    /// `emit_sync` awaits it inline on the dispatching task (no spawn), which
+    /// is the low-overhead hot path for high-frequency events.
+    pub(crate) async fn on_sync(
+        ctx: &Context,
+        name: &str,
+        callback: Listener,
+        prepend: bool,
+        global: bool,
+    ) -> Result<EffectGuard> {
+        Self::on_with(ctx, name, callback, prepend, global, true).await
+    }
+
+    async fn on_with(
+        ctx: &Context,
+        name: &str,
+        callback: Listener,
+        prepend: bool,
+        global: bool,
+        sync: bool,
+    ) -> Result<EffectGuard> {
         let label = format!("ctx.on({name})");
         let event_name = name.to_string();
         let ctx_for_effect = ctx.clone();
@@ -146,6 +173,7 @@ impl EventsService {
                 callback: cb_for_effect.clone(),
                 prepend,
                 global,
+                sync,
             };
             ctx_for_effect
                 .root
@@ -165,30 +193,67 @@ impl EventsService {
         .await
     }
 
-    fn listeners(ctx: &Context, name: &str) -> Vec<(Context, Listener)> {
+    fn listeners(ctx: &Context, name: &str) -> Vec<(Context, Listener, bool)> {
         ctx.root.events.lock().unwrap().dispatch(name, None)
     }
 
     /// Concurrent dispatch; waits for every listener and aggregates failures
     /// into `Error::Aggregate` (mirrors JS `Promise.allSettled` + `AggregateError`).
     pub async fn parallel(ctx: &Context, name: &str, payload: Value) -> Result<Value> {
+        Self::parallel_bounded(ctx, name, payload, None).await
+    }
+
+    /// Like [`EventsService::parallel`], but gives up after `timeout`;
+    /// unconverged listeners are abandoned and a `CordisCode::Timeout` error
+    /// is reported (a P2 hardening: no dispatch waits forever).
+    pub async fn parallel_timeout(
+        ctx: &Context,
+        name: &str,
+        payload: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        Self::parallel_bounded(ctx, name, payload, Some(timeout)).await
+    }
+
+    async fn parallel_bounded(
+        ctx: &Context,
+        name: &str,
+        payload: Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value> {
         let listeners = Self::listeners(ctx, name);
         if listeners.is_empty() {
             return Ok(payload);
         }
         let mut set = tokio::task::JoinSet::new();
-        for (hook_ctx, callback) in listeners {
+        for (hook_ctx, callback, _sync) in listeners {
             let payload = payload.clone();
             let next = Next::with_steps(hook_ctx.clone(), VecDeque::new(), None);
             set.spawn(async move { (callback)(hook_ctx, payload, next).await });
         }
         let mut errors = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => errors.push(err),
-                Err(join_err) => errors.push(Error::msg(join_err.to_string())),
+        let mut timed_out = false;
+        let join_all = async {
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => errors.push(err),
+                    Err(join_err) => errors.push(Error::msg(join_err.to_string())),
+                }
             }
+        };
+        match timeout {
+            Some(limit) => {
+                if tokio::time::timeout(limit, join_all).await.is_err() {
+                    timed_out = true;
+                    // Abandon unfinished listeners: they keep running detached
+                    // until the runtime drops them.
+                }
+            }
+            None => join_all.await,
+        }
+        if timed_out {
+            return Err(CordisError::new(CordisCode::Timeout).into());
         }
         if errors.is_empty() {
             Ok(payload)
@@ -201,7 +266,7 @@ impl EventsService {
     pub fn emit(ctx: &Context, name: &str, payload: Value) {
         let event_name = name.to_string();
         let listeners = Self::listeners(ctx, name);
-        for (hook_ctx, callback) in listeners {
+        for (hook_ctx, callback, _sync) in listeners {
             let payload = payload.clone();
             let next = Next::with_steps(hook_ctx.clone(), VecDeque::new(), None);
             let logger_ctx = ctx.clone();
@@ -219,6 +284,44 @@ impl EventsService {
         }
     }
 
+    /// Fall-through dispatch for the **sync slot**: listeners registered with
+    /// `ctx.on_sync` are awaited INLINE on this task (zero spawns); ordinary
+    /// listeners keep the fire-and-forget spawn path. Errors from sync
+    /// listeners are reported (aggregated), never swallowed.
+    pub async fn emit_sync(ctx: &Context, name: &str, payload: Value) -> Result<()> {
+        let event_name = name.to_string();
+        let listeners = Self::listeners(ctx, name);
+        let mut sync_errors: Vec<Error> = Vec::new();
+        let mut sync_fired = 0usize;
+        for (hook_ctx, callback, sync) in listeners {
+            let payload = payload.clone();
+            let next = Next::with_steps(hook_ctx.clone(), VecDeque::new(), None);
+            if sync {
+                sync_fired += 1;
+                if let Err(err) = (callback)(hook_ctx, payload, next).await {
+                    sync_errors.push(err);
+                }
+            } else {
+                let logger_ctx = ctx.clone();
+                let label = event_name.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = (callback)(hook_ctx, payload, next).await {
+                        logger_ctx
+                            .logger()
+                            .log(
+                                crate::logger::LogLevel::Warn,
+                                format!("[{label}] listener failed: {err}"),
+                            );
+                    }
+                });
+            }
+        }
+        if sync_fired > 0 && !sync_errors.is_empty() {
+            return Err(Error::aggregate(sync_errors));
+        }
+        Ok(())
+    }
+
     /// Scoped variant: only listeners whose context satisfies `filter` fire.
     pub(crate) fn emit_filtered(
         ctx: &Context,
@@ -228,7 +331,7 @@ impl EventsService {
     ) {
         let event_name = name.to_string();
         let listeners = ctx.root.events.lock().unwrap().dispatch(name, Some(&filter));
-        for (hook_ctx, callback) in listeners {
+        for (hook_ctx, callback, _sync) in listeners {
             let payload = payload.clone();
             let next = Next::with_steps(hook_ctx.clone(), VecDeque::new(), None);
             let logger_ctx = ctx.clone();
@@ -252,7 +355,7 @@ impl EventsService {
         // Mirrors cordis: listener arguments are never rewritten by non-bail
         // returns; only a bail value short-circuits and becomes the result.
         let payload = payload;
-        for (hook_ctx, callback) in listeners {
+        for (hook_ctx, callback, _sync) in listeners {
             let next = Next::with_steps(hook_ctx.clone(), VecDeque::new(), None);
             let returned = (callback)(hook_ctx, payload.clone(), next).await?;
             if is_bailed(&returned) {
@@ -283,7 +386,7 @@ impl EventsService {
         let listeners = Self::listeners(ctx, name);
         let fallback: Arc<dyn Fn(Value) -> BoxFuture<Result<Value>> + Send + Sync> =
             Arc::new(fallback);
-        let mut steps: VecDeque<Listener> = listeners.into_iter().map(|(_, cb)| cb).collect();
+        let mut steps: VecDeque<Listener> = listeners.into_iter().map(|(_, cb, _)| cb).collect();
         match steps.pop_front() {
             Some(first) => {
                 // Every continuation keeps the same terminal fallback so the
