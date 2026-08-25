@@ -8,6 +8,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository = "https://github.com/redoop/cordis-rust"
+readme = "../../README.md"
 keywords = ["plugin", "kernel", "dependency-injection", "event-bus", "framework"]
 categories = ["development-tools", "asynchronous"]
 

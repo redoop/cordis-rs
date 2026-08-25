@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/cordis-rust)](https://crates.io/crates/cordis-rust)
 [![docs.rs](https://img.shields.io/docsrs/cordis-rust)](https://docs.rs/cordis-rust)
 
-> [**中文版 README**](README.zh-CN.md) · [English](README.md)
+> [**中文版 README**](https://github.com/redoop/cordis-rust/blob/main/README.zh-CN.md) · [English](https://github.com/redoop/cordis-rust/blob/main/README.md)
 
 A Rust port of the cordis kernel that powers the DSH plugin system. Same
 mental model, same lifecycle grammar, adapted to ownership: the runtime is
